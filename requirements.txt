@@ -1,0 +1,20 @@
+# Exact versions that are known to work together (the ones the .exe is built
+# with). Pinned on purpose: yfinance changes whenever Yahoo changes its site,
+# so an unpinned install could quietly pull a version that breaks the app.
+# To upgrade: change a version here, run the tests (run_tests.bat), rebuild.
+# Needs Python 3.12 or newer (numpy 2.5 requires it).
+yfinance==1.7.0
+curl_cffi==0.16.3
+requests==2.34.2
+pandas==3.0.6
+numpy==2.5.3
+flask==3.1.3
+werkzeug==3.1.8
+reportlab==5.0.1
+pillow==12.3.0
+openpyxl==3.1.5
+waitress==3.0.2
+tzdata==2026.4
+# system-tray icon of the Windows .exe (not needed elsewhere)
+pystray==0.19.5; sys_platform == "win32"
+six==1.17.0; sys_platform == "win32"

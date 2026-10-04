@@ -1,0 +1,13 @@
+# Never commit settings, passwords, databases or generated reports.
+config.json
+config.json.tmp
+*.db
+*.db-shm
+*.db-wal
+watchlist.json
+reports/
+logs/
+backups/
+__pycache__/
+*.pyc
+.venv/

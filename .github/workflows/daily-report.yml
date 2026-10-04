@@ -1,0 +1,65 @@
+name: Daily report
+
+# Builds the daily PDF report on GitHub's servers and sends it by email and
+# Telegram, so it arrives even when the laptop is switched off.
+
+on:
+  schedule:
+    - cron: "30 3 * * *"        # 09:00 India time (GitHub schedules are in UTC)
+  workflow_dispatch:
+    inputs:
+      send:
+        description: "Send the report (untick to only build it)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-report
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TZ: Asia/Kolkata          # dates in the report and its file name
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Install the app's Python packages
+        run: pip install -r requirements.txt
+
+      # Company details and score history carry over from the previous run,
+      # which keeps the number of requests to Yahoo Finance low.
+      - name: Restore the market-data cache
+        uses: actions/cache@v6
+        with:
+          path: data_cache.db*
+          key: data-cache-${{ github.run_id }}
+          restore-keys: data-cache-
+
+      - name: Build and send the report
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python cloud_report.py ${{ (github.event_name == 'workflow_dispatch' && !inputs.send) && '--no-send' || '' }}
+
+      - name: Keep a copy of the PDF with this run
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: report-${{ github.run_id }}
+          path: reports/*.pdf
+          retention-days: 14
+          if-no-files-found: ignore
