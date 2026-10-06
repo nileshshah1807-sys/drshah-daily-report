@@ -5,11 +5,27 @@ name: Daily report
 
 on:
   schedule:
-    - cron: "30 3 * * *"        # 09:00 India time (GitHub schedules are in UTC)
+    # GitHub starts scheduled runs late, and some days not at all, so the report
+    # is tried several times a day. The first try that gets through sends it;
+    # every later try sees that it has gone and stops within seconds.
+    # Times are in UTC; India time is 5 h 30 min ahead.
+    - cron: "17 3 * * *"        # 08:47 India time: waits, then sends for 09:00
+    - cron: "31 3 * * *"        # 09:01
+    - cron: "53 3 * * *"        # 09:23
+    - cron: "23 4 * * *"        # 09:53
+    - cron: "7 5 * * *"         # 10:37
+    - cron: "7 6 * * *"         # 11:37
+    - cron: "37 7 * * *"        # 13:07
+    - cron: "37 9 * * *"        # 15:07
+    - cron: "37 11 * * *"       # 17:07
   workflow_dispatch:
     inputs:
       send:
         description: "Send the report (untick to only build it)"
+        type: boolean
+        default: true
+      again:
+        description: "Send it even if today's report has already gone out"
         type: boolean
         default: true
 
@@ -23,23 +39,53 @@ concurrency:
 jobs:
   report:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
-      TZ: Asia/Kolkata          # dates in the report and its file name
+      TZ: Asia/Kolkata          # dates in the report and its file name, and the 09:00 it aims for
+      FLAGS: >-
+        ${{ (github.event_name == 'workflow_dispatch' && !inputs.send) && '--no-send' || '' }}
+        ${{ (github.event_name == 'workflow_dispatch' && inputs.again) && '--again' || '' }}
     steps:
       - uses: actions/checkout@v7
 
+      # Which channels today's report has already reached, left by an earlier run today.
+      - name: Today's date
+        id: today
+        run: echo "date=$(date +%F)" >> "$GITHUB_OUTPUT"
+
+      - name: Look for today's delivery record
+        uses: actions/cache/restore@v6
+        with:
+          path: .sent
+          key: sent-${{ steps.today.outputs.date }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: sent-${{ steps.today.outputs.date }}-
+
+      # Uses the runner's own Python: nothing is installed unless there is a report to send.
+      - name: Decide whether there is anything to do
+        id: plan
+        env:
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: python3 cloud_report.py --plan $FLAGS
+
+      - name: Wait until just before 09:00
+        if: steps.plan.outputs.run == 'true' && steps.plan.outputs.wait != '0'
+        run: sleep ${{ steps.plan.outputs.wait }}
+
       - uses: actions/setup-python@v7
+        if: steps.plan.outputs.run == 'true'
         with:
           python-version: "3.14"
           cache: pip
 
       - name: Install the app's Python packages
+        if: steps.plan.outputs.run == 'true'
         run: pip install -r requirements.txt
 
       # Company details and score history carry over from the previous run,
       # which keeps the number of requests to Yahoo Finance low.
       - name: Restore the market-data cache
+        if: steps.plan.outputs.run == 'true'
         uses: actions/cache@v6
         with:
           path: data_cache.db*
@@ -47,16 +93,27 @@ jobs:
           restore-keys: data-cache-
 
       - name: Build and send the report
+        id: report
+        if: steps.plan.outputs.run == 'true'
         env:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python cloud_report.py ${{ (github.event_name == 'workflow_dispatch' && !inputs.send) && '--no-send' || '' }}
+        run: python cloud_report.py $FLAGS
+
+      # Saved even when the step above reports a problem: a channel the report
+      # did reach must not get it a second time from a later try.
+      - name: Record what was delivered today
+        if: always() && steps.report.outputs.recorded == 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: .sent
+          key: sent-${{ steps.today.outputs.date }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Keep a copy of the PDF with this run
-        if: always()
+        if: always() && steps.plan.outputs.run == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: report-${{ github.run_id }}

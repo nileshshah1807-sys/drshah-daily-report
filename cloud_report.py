@@ -14,6 +14,13 @@ variables (GitHub Secrets), never from a file in the repository:
 
   python cloud_report.py             build the report and deliver it
   python cloud_report.py --no-send   build the PDF only (test)
+  python cloud_report.py --again     deliver it even if today's report has already gone out
+  python cloud_report.py --plan      only decide whether this run has anything to do
+
+GitHub starts scheduled runs late, and some days not at all, so the workflow
+tries several times a day. Each channel the report reaches is recorded for the
+day (.sent/channels, carried between runs by the workflow), and a later try
+sends only to the channels still missing: one report a day per channel.
 """
 import json
 import logging
@@ -21,15 +28,25 @@ import os
 import sqlite3
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import paths
 
 NO_SEND = "--no-send" in sys.argv[1:]
+AGAIN = "--again" in sys.argv[1:]
+PLAN = "--plan" in sys.argv[1:]
 MIN_SHARE_ANALYSED = 0.5        # fewer stocks than this: the data source is failing
 BACKFILL_WAIT_S = 6 * 60        # score-history rebuild on a fresh cache
 DELIVERY_RETRIES = 4
 DELIVERY_RETRY_PAUSE_S = 45
+SEND_AT = (9, 0)                # the report's time of day; the workflow sets the time zone (India)
+BUILD_LEAD_S = 2 * 60           # installing and building take about this long
+MAX_WAIT_S = 15 * 60            # the longest a run that started early waits for SEND_AT
+CHANNEL_SECRET = {"email": "SMTP_PASS", "telegram": "TELEGRAM_BOT_TOKEN"}
+SENT_MARK = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".sent", "channels")
+NOT_SET_UP = ("Not set up yet: no email or Telegram password has been added to this repository's "
+              "secrets, so there is nothing to deliver with. Add SMTP_USER, SMTP_PASS, EMAIL_TO, "
+              "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID under Settings > Secrets and variables > Actions.")
 
 log = logging.getLogger("cloud")
 
@@ -38,14 +55,54 @@ def _env(name: str, default: str = "") -> str:
     return (os.environ.get(name) or default).strip()
 
 
-def write_config() -> None:
-    """config.json for this run, in the shape the app's own settings use."""
+def configured() -> list[str]:
+    """The channels whose password is in the repository's secrets."""
+    return [ch for ch, secret in CHANNEL_SECRET.items() if _env(secret)]
+
+
+def sent_today() -> set[str]:
+    """The channels today's report has already reached, as recorded by an earlier run."""
+    try:
+        with open(SENT_MARK, encoding="utf-8") as f:
+            mark = json.load(f)
+        if mark.get("date") == f"{datetime.now():%Y-%m-%d}":
+            return {str(ch) for ch in mark.get("channels") or []}
+    except (OSError, ValueError, AttributeError):
+        pass
+    return set()
+
+
+def record_sent(channels: set[str]) -> None:
+    os.makedirs(os.path.dirname(SENT_MARK), exist_ok=True)
+    with open(SENT_MARK, "w", encoding="utf-8") as f:
+        json.dump({"date": f"{datetime.now():%Y-%m-%d}", "channels": sorted(channels)}, f)
+
+
+def channels_due() -> list[str]:
+    """The set-up channels this run should deliver to."""
+    if NO_SEND:
+        return []
+    have = configured()
+    return have if AGAIN else [ch for ch in have if ch not in sent_today()]
+
+
+def output(**values) -> None:
+    """Hand values to the later steps of the workflow."""
+    target = os.environ.get("GITHUB_OUTPUT")
+    if target:
+        with open(target, "a", encoding="utf-8") as f:
+            f.writelines(f"{k}={v}\n" for k, v in values.items())
+
+
+def write_config(due: list[str]) -> None:
+    """config.json for this run, in the shape the app's own settings use.
+    Only the channels in `due` are switched on."""
     smtp_user = _env("SMTP_USER")
-    send = not NO_SEND
+    email, telegram = "email" in due, "telegram" in due
     cfg = {
         "secret_key": "cloud-run",       # only the web app uses it; set so nothing is generated
         "email": {
-            "enabled": send and bool(_env("SMTP_PASS")),
+            "enabled": email,
             "smtp_host": _env("SMTP_HOST", "smtp.gmail.com"),
             "smtp_port": int(_env("SMTP_PORT", "587")),
             "smtp_user": smtp_user,
@@ -54,12 +111,13 @@ def write_config() -> None:
             "to_addr": _env("EMAIL_TO"),
         },
         "telegram": {
-            "enabled": send and bool(_env("TELEGRAM_BOT_TOKEN")),
+            "enabled": telegram,
             "bot_token": _env("TELEGRAM_BOT_TOKEN"),
             "chat_id": _env("TELEGRAM_CHAT_ID"),
         },
-        "schedule": {"enabled": True, "time": "09:00", "email_delivery": send,
-                     "telegram_delivery": send, "keep_days": 30},
+        # a channel with no password is "not set up", not a failed delivery
+        "schedule": {"enabled": True, "time": "09:00", "email_delivery": email,
+                     "telegram_delivery": telegram, "keep_days": 30},
         "prewarm": {"enabled": False, "interval_minutes": 15, "market_hours_only": True},
     }
     with open(paths.CONFIG_PATH, "w") as f:
@@ -126,6 +184,47 @@ def summary(lines: list[str]) -> None:
             f.write("\n".join(lines) + "\n")
 
 
+def nothing_to_do(have: list[str], due: list[str]) -> bool:
+    """True, with the reason logged, when this run has no report to deliver."""
+    if NO_SEND:
+        return False
+    # Until the repository's secrets are added there is nothing to deliver with.
+    # That is "not set up yet", not a failure: say so and stop, instead of
+    # failing (and emailing a failure notice) every morning.
+    if not have:
+        log.warning(NOT_SET_UP)
+        summary(["### Daily report: not set up yet", NOT_SET_UP])
+        return True
+    if not due:
+        msg = f"Today's report has already been sent ({', '.join(have)}). Nothing to do."
+        log.info(msg)
+        summary(["### Daily report: already sent today", msg])
+        return True
+    return False
+
+
+def plan() -> int:
+    """The workflow's first step, before anything is installed: is there a report
+    to send, and should this run wait for 09:00 first? Every try after the one
+    that delivered stops here, within seconds."""
+    have, due = configured(), channels_due()
+    run, wait = not nothing_to_do(have, due), 0
+    if NO_SEND:
+        log.info("test run: the report will be built but not sent")
+    elif run:
+        log.info("to send: %s", ", ".join(due))
+        if os.environ.get("GITHUB_EVENT_NAME") == "schedule":
+            now = datetime.now()
+            start = (now.replace(hour=SEND_AT[0], minute=SEND_AT[1], second=0, microsecond=0)
+                     - timedelta(seconds=BUILD_LEAD_S))
+            wait = int(min(MAX_WAIT_S, max(0.0, (start - now).total_seconds())))
+            if wait:
+                log.info("started early: waiting %d min %02d s so the report goes out at %02d:%02d",
+                         wait // 60, wait % 60, *SEND_AT)
+    output(run=str(run).lower(), wait=wait)
+    return 0
+
+
 def main() -> int:
     logging.basicConfig(level=logging.INFO, stream=sys.stdout,
                         format="%(asctime)s  %(levelname)-7s %(name)s: %(message)s",
@@ -133,18 +232,13 @@ def main() -> int:
     for noisy in ("urllib3", "peewee", "yfinance"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    # Until the repository's secrets are added there is nothing to deliver with.
-    # That is "not set up yet", not a failure: say so and stop, instead of
-    # failing (and emailing a failure notice) every morning.
-    if not NO_SEND and not (_env("SMTP_PASS") or _env("TELEGRAM_BOT_TOKEN")):
-        msg = ("Not set up yet: no email or Telegram password has been added to this repository's "
-               "secrets, so there is nothing to deliver with. Add SMTP_USER, SMTP_PASS, EMAIL_TO, "
-               "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID under Settings > Secrets and variables > Actions.")
-        log.warning(msg)
-        summary(["### Daily report: not set up yet", msg])
+    if PLAN:
+        return plan()
+    have, due = configured(), channels_due()
+    if nothing_to_do(have, due):
         return 0
 
-    write_config()
+    write_config(due)
     # imported after config.json exists: these modules read it
     import alerts
     import analysis
@@ -211,16 +305,26 @@ def main() -> int:
         scheduler.retry_pending_deliveries(now=time.time() + scheduler.RETRY_EVERY_S + 1)
     still_failing = {ch for it in scheduler._load_pending() for ch in it.get("channels") or []}
 
-    outcome, failed = [], bool(problems)
-    for ch in ("email", "telegram"):
-        if ch not in wanted:
+    outcome, failed, reached = [], bool(problems), set()
+    for ch in CHANNEL_SECRET:
+        if ch not in have:
             outcome.append(f"- {ch}: not set up")
-            continue
-        ok = done.get(ch) is True or (ch in queued and ch not in still_failing)
-        outcome.append(f"- {ch}: {'sent' if ok else 'FAILED'}")
-        failed = failed or not ok
+        elif ch not in due:
+            outcome.append(f"- {ch}: already sent earlier today")
+        elif ch not in wanted:
+            outcome.append(f"- {ch}: FAILED (its settings are incomplete)")
+        else:
+            ok = done.get(ch) is True or (ch in queued and ch not in still_failing)
+            outcome.append(f"- {ch}: {'sent' if ok else 'FAILED'}")
+            failed = failed or not ok
+            if ok:
+                reached.add(ch)
     for line in outcome:
         log.info(line)
+    if reached:
+        # so that today's later tries do not send it to these channels again
+        record_sent(sent_today() | reached)
+        output(recorded="true")
     summary([f"### Daily report: {'delivery problem' if failed else 'sent'}",
              f"{len(results)} of {len(tickers)} stocks analysed.", *outcome,
              *(f"- skipped {t}: {why}" for t, why in errors.items())])

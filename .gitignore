@@ -6,6 +6,7 @@ config.json.tmp
 *.db-wal
 watchlist.json
 reports/
+.sent/
 logs/
 backups/
 __pycache__/
