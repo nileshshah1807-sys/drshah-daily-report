@@ -133,6 +133,17 @@ def main() -> int:
     for noisy in ("urllib3", "peewee", "yfinance"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
+    # Until the repository's secrets are added there is nothing to deliver with.
+    # That is "not set up yet", not a failure: say so and stop, instead of
+    # failing (and emailing a failure notice) every morning.
+    if not NO_SEND and not (_env("SMTP_PASS") or _env("TELEGRAM_BOT_TOKEN")):
+        msg = ("Not set up yet: no email or Telegram password has been added to this repository's "
+               "secrets, so there is nothing to deliver with. Add SMTP_USER, SMTP_PASS, EMAIL_TO, "
+               "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID under Settings > Secrets and variables > Actions.")
+        log.warning(msg)
+        summary(["### Daily report: not set up yet", msg])
+        return 0
+
     write_config()
     # imported after config.json exists: these modules read it
     import alerts

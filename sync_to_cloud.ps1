@@ -9,7 +9,7 @@ param([switch]$Code)
 $ErrorActionPreference = 'Stop'
 $repo    = $PSScriptRoot
 $appDb   = 'C:\DrShah\app.db'
-$source  = 'C:\Users\NILESH SHAH\OneDrive\Desktop\us stock market 4\DrShah_US_Stocks_Analysis'
+$source  = 'D:\us stock market 4\DrShah_US_Stocks_Analysis'
 $logDir  = Join-Path $repo 'logs'
 $logFile = Join-Path $logDir 'sync.log'
 
