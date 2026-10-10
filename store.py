@@ -2,6 +2,7 @@
 Persistence layer — SQLite (users, per-user watchlists, alerts, notifications),
 app config (config.json) and the guest watchlist (watchlist.json).
 """
+import hashlib
 import json
 import os
 import sqlite3
@@ -9,6 +10,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import datetime
 
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -154,6 +156,36 @@ def verify_user(username: str, password: str):
     if user and check_password_hash(user["password_hash"], password):
         return user
     return None
+
+
+def set_password(user_id: int, new_password: str) -> None:
+    """Store a new password for an account and note when it was changed."""
+    with _lock, db() as c:
+        c.execute("UPDATE users SET password_hash = ? WHERE id = ?",
+                  (generate_password_hash(new_password), user_id))
+    set_pref(user_id, "password_changed_at", datetime.now().isoformat(timespec="seconds"))
+
+
+def password_stamp(user_id) -> tuple[str, bool] | None:
+    """(fingerprint of the account's current password, was it ever changed?)
+    — None when the account does not exist.
+
+    A signed-in browser carries the fingerprint it signed in with, so after a
+    password change every OTHER browser is signed out. The fingerprint is a
+    hash of the stored hash: it says nothing about the password itself.
+    """
+    with _lock, db() as c:
+        row = c.execute("SELECT password_hash FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not row:
+            return None
+        prefs = c.execute("SELECT prefs FROM user_prefs WHERE user_id = ?",
+                          (user_id,)).fetchone()
+    try:
+        changed = bool(json.loads(prefs["prefs"]).get("password_changed_at")) if prefs else False
+    except Exception:  # noqa: BLE001
+        changed = False
+    stamp = hashlib.sha256(row["password_hash"].encode("utf-8")).hexdigest()[:16]
+    return stamp, changed
 
 
 # ---------------------------------------------------------------------------

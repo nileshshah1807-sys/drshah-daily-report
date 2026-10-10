@@ -3,7 +3,7 @@ Dr. SHAH'S US STOCKS ANALYSIS — Flask application
 ===================================================
 Endpoints:
   GET   /                              → dashboard
-  Auth: /api/auth/me | register | login | logout        (session cookies)
+  Auth: /api/auth/me | register | login | logout | password   (session cookies)
   Watchlist: /api/watchlist | add | remove | import | save   (per-user)
   Analysis: /api/analyze | /api/stock/<ticker>
   Alerts: GET/POST /api/alerts | toggle | delete
@@ -19,6 +19,7 @@ import os
 import re
 import sys
 import threading
+import time
 import traceback
 from datetime import datetime, timedelta
 from urllib.parse import urlsplit
@@ -104,7 +105,29 @@ def _is_this_computer() -> bool:
 def _sign_in(user_id: int) -> None:
     session.clear()
     session["user_id"] = int(user_id)
+    stamp = store.password_stamp(int(user_id))
+    if stamp:
+        session["pw"] = stamp[0]      # see _still_signed_in()
     session.permanent = True          # survives closing the browser (1 year)
+
+
+def _still_signed_in() -> None:
+    """Sign this browser out if its account's password was changed after it
+    signed in: a session carries a fingerprint of the password it was opened
+    with, so changing the password signs every OTHER browser out."""
+    uid = session.get("user_id")
+    if not uid:
+        return
+    stamp = store.password_stamp(int(uid))
+    if stamp is None:
+        return                        # account removed — /api/auth/me tidies up
+    fingerprint, changed_before = stamp
+    if session.get("pw") == fingerprint:
+        return
+    if "pw" not in session and not changed_before:
+        session["pw"] = fingerprint   # signed in before this check existed
+        return
+    session.clear()
 
 
 @app.before_request
@@ -115,6 +138,9 @@ def _guard_and_auto_sign_in():
         origin = request.headers.get("Origin")
         if origin and urlsplit(origin).netloc != request.host:
             return jsonify({"ok": False, "error": "Cross-site request refused."}), 403
+
+    if not request.path.startswith("/static/"):
+        _still_signed_in()
 
     # 2) Automatic sign-in — only for a browser on THIS computer, only when it
     #    has been switched on for an account, and not right after "Sign out"
@@ -330,16 +356,98 @@ def api_auth_register():
     return jsonify({"ok": True, "username": username})
 
 
+# Wrong passwords are counted per address (this computer included). After
+# LOGIN_MAX_FAILS of them within LOGIN_WINDOW_S that address has to wait until
+# the oldest one is a window old. A correct sign-in does NOT wipe the count —
+# otherwise anyone with an account of their own could reset it between guesses
+# at somebody else's password. Kept in memory: a restart clears it.
+LOGIN_MAX_FAILS = 8
+LOGIN_WINDOW_S = 15 * 60
+MIN_NEW_PASSWORD = 8
+_login_fails: dict[str, list[float]] = {}
+_login_lock = threading.Lock()
+
+
+def _login_wait(addr: str) -> int:
+    """Seconds this address must wait before its next password attempt (0 = none)."""
+    now = time.time()
+    with _login_lock:
+        for quiet in [a for a, ts in _login_fails.items() if now - ts[-1] > LOGIN_WINDOW_S]:
+            del _login_fails[quiet]
+        recent = [t for t in _login_fails.get(addr, []) if now - t <= LOGIN_WINDOW_S]
+        if len(recent) < LOGIN_MAX_FAILS:
+            return 0
+        return max(1, int(recent[-LOGIN_MAX_FAILS] + LOGIN_WINDOW_S - now))
+
+
+def _login_failed(addr: str) -> None:
+    now = time.time()
+    with _login_lock:
+        recent = [t for t in _login_fails.get(addr, []) if now - t <= LOGIN_WINDOW_S]
+        _login_fails[addr] = (recent + [now])[-LOGIN_MAX_FAILS:]
+
+
+def _too_many_attempts(wait_s: int):
+    mins = max(1, round(wait_s / 60))
+    unit = "minute" if mins == 1 else "minutes"
+    return jsonify({"ok": False, "error": "Too many wrong passwords. Please wait about "
+                    f"{mins} {unit} and try again."}), 429
+
+
 @app.route("/api/auth/login", methods=["POST"])
 def api_auth_login():
+    addr = request.remote_addr or ""
+    wait = _login_wait(addr)
+    if wait:
+        return _too_many_attempts(wait)
     body = _json_body()
     username = str(body.get("username", "")).strip()
     password = str(body.get("password", ""))
     user = store.verify_user(username, password)
     if not user:
+        _login_failed(addr)
         return jsonify({"ok": False, "error": "Invalid username or password."}), 401
     _sign_in(user["id"])
     return jsonify({"ok": True, "username": user["username"], "email": user["email"]})
+
+
+@app.route("/api/auth/password", methods=["POST"])
+def api_auth_password():
+    """Change the signed-in account's password.
+
+    The current password is asked for — except in a browser on the computer
+    the app runs on, where the owner is usually signed in automatically and
+    may never have typed it (whoever sits at that computer already has the
+    app's files). Every other browser signed in to the account is signed out
+    by the change (see _still_signed_in)."""
+    uid, err = _require_user()
+    if err:
+        return err
+    user = store.get_user(uid)
+    if not user:
+        return jsonify({"ok": False, "error": "Please sign in again."}), 401
+    body = _json_body()
+    current = str(body.get("current", ""))
+    new = str(body.get("new", ""))
+    if current or not _is_this_computer():
+        addr = request.remote_addr or ""
+        wait = _login_wait(addr)
+        if wait:
+            return _too_many_attempts(wait)
+        if not store.verify_user(user["username"], current):
+            _login_failed(addr)
+            return jsonify({"ok": False, "error": "The current password is not correct."}), 403
+    if len(new) < MIN_NEW_PASSWORD:
+        return jsonify({"ok": False, "error": "The new password must be at least "
+                        f"{MIN_NEW_PASSWORD} characters."}), 400
+    if len(new) > 128:
+        return jsonify({"ok": False, "error": "Password is too long (maximum 128 characters)."}), 400
+    if store.verify_user(user["username"], new):
+        return jsonify({"ok": False, "error": "That is already the password. "
+                        "Please choose a different one."}), 400
+    store.set_password(uid, new)
+    _sign_in(uid)                     # this browser stays in; the others are signed out
+    return jsonify({"ok": True, "username": user["username"]})
 
 
 @app.route("/api/auth/logout", methods=["POST"])
@@ -531,18 +639,17 @@ def api_alerts_create():
     body = _json_body()
     ticker = str(body.get("ticker", "")).strip().upper()
     kind = str(body.get("kind", ""))
-    value = body.get("value")
     channels = body.get("channels") or ["app"]
     if not TICKER_RE.match(ticker):
         return jsonify({"ok": False, "error": "Invalid ticker symbol."}), 400
     if kind not in VALID_ALERT_KINDS:
         return jsonify({"ok": False, "error": "Unknown alert condition."}), 400
-    if kind not in NO_VALUE_KINDS and value in (None, ""):
-        return jsonify({"ok": False, "error": "Please set a target value."}), 400
-    if kind == "rating_is" and value not in ("Strong Buy", "Buy", "Hold", "Sell", "Strong Sell"):
-        return jsonify({"ok": False, "error": "Please choose a rating."}), 400
-    if not isinstance(channels, list) or not channels:
+    value, problem = _alert_value(kind, body.get("value"))
+    if problem:
+        return jsonify({"ok": False, "error": problem}), 400
+    if not isinstance(channels, list):
         channels = ["app"]
+    channels = [c for c in channels if c in VALID_CHANNELS] or ["app"]
     aid = store.add_alert(uid, ticker, kind, value, channels, repeat=bool(body.get("repeat")))
     return jsonify({"ok": True, "id": aid})
 
@@ -1022,6 +1129,38 @@ VALID_ALERT_KINDS = {"price_above", "price_below", "rsi_above", "rsi_below",
 NO_VALUE_KINDS = ("breakout", "breakdown", "rating_change")   # need no target value
 VALID_CHANNELS = {"app", "email", "telegram"}
 SETTINGS_KEYS = ("alert_check_minutes", "email", "telegram", "schedule", "prewarm")
+SAVED_PASSWORDS = (("email", "smtp_pass"), ("telegram", "bot_token"))
+
+
+def _alert_value(kind: str, value):
+    """(the target as it is stored, None) — or (None, why it cannot be used).
+
+    The page checks what is typed too, but a request can be sent without the
+    page: a price alert at -5 or an RSI alert at 400 could never fire and
+    would sit in the list looking armed.
+    """
+    if kind in NO_VALUE_KINDS:
+        return "", None
+    if kind == "rating_is":
+        rating = value.strip() if isinstance(value, str) else ""
+        if rating not in analyzer.RATING_NAMES:
+            return None, "Please choose a rating."
+        return rating, None
+    if value in (None, "") or isinstance(value, bool):
+        return None, "Please set a target value."
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None, "The target value must be a number."
+    if num != num or num in (float("inf"), float("-inf")):
+        return None, "The target value must be a number."
+    if kind in ("price_above", "price_below"):
+        if not 0 < num <= 1_000_000:
+            return None, "The price must be more than 0."
+    elif not 0 <= num <= 100:
+        what = "RSI" if kind.startswith("rsi_") else "The score"
+        return None, f"{what} must be between 0 and 100."
+    return (int(num) if num == int(num) else num), None
 
 
 def _sanitize_tickers(items) -> list[str]:
@@ -1042,8 +1181,8 @@ def _sanitize_alerts(items) -> list[dict]:
         kind = str(a.get("kind", ""))
         if not TICKER_RE.match(tk) or kind not in VALID_ALERT_KINDS:
             continue
-        value = a.get("value")
-        if kind not in NO_VALUE_KINDS and value in (None, ""):
+        value, problem = _alert_value(kind, a.get("value"))
+        if problem:
             continue
         chans = a.get("channels") or ["app"]
         if isinstance(chans, str):
@@ -1111,7 +1250,14 @@ def api_backup():
         # can forge a login cookie for ANY account (restore ignores it anyway)
         settings.pop("secret_key", None)
         settings.pop("auto_login", None)      # belongs to this installation
+        # The email and Telegram passwords stay on this computer too: a
+        # downloaded file gets copied, emailed and forgotten in Downloads.
+        # Restoring a backup keeps the passwords that are saved here.
+        for section, key in SAVED_PASSWORDS:
+            if isinstance(settings.get(section), dict):
+                settings[section][key] = ""
         payload["settings"] = settings
+        payload["passwords_included"] = False
     data = json.dumps(payload, indent=2).encode("utf-8")
     return _send_bytes(data, "application/json", "drshah_backup.json", attach=True)
 
@@ -1149,7 +1295,9 @@ def api_backup_restore():
         return jsonify({
             "ok": True,
             "message": f"Restored {len(tickers)} stocks, {len(alerts_in)} alert(s)"
-                       + (" and settings." if admin else ". (App settings can only be restored "
+                       + (" and settings. (Email and Telegram passwords are not part of a "
+                          "backup file — the ones saved on this computer were kept.)"
+                          if admin else ". (App settings can only be restored "
                           "on the computer the app runs on.)"),
             "watchlist": tickers})
     except Exception as e:  # noqa: BLE001

@@ -66,9 +66,14 @@ def load() -> dict | None:
     try:
         with analysis._snap_conn() as c:
             row = c.execute("SELECT payload FROM backtest_result WHERE id = 1").fetchone()
-        return json.loads(row[0]) if row else None
+        result = json.loads(row[0]) if row else None
     except Exception:  # noqa: BLE001
         return None
+    # a result worked out by an earlier scoring engine says nothing about
+    # the ratings shown today — the test has to be run again
+    if result and result.get("engine_v") != analysis.ENGINE_VERSION:
+        return None
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +95,7 @@ def signals_for(ticker: str, df, bench) -> list[dict]:
     close = df["Close"].to_numpy()
     b = _aligned(bench, df.index)
     stored = analysis._history(ticker)
+    scores = analysis.closing_scores(df, bench)     # every session, one pass
     new_rows, out = [], []
     shortest = min(n for _, n in HORIZONS)
     for pos in range(WARMUP, len(df) - shortest, STEP):
@@ -98,7 +104,7 @@ def signals_for(ticker: str, df, bench) -> list[dict]:
         if h and h["final"]:
             score, rating = h["score"], h["rating"]
         else:
-            row = analysis._score_at(df, pos, bench)
+            row = scores.get(day) or analysis._score_at(df, pos, bench)
             new_rows.append(row)
             score, rating = row[1], row[2]
         sig = {"ticker": ticker, "date": day, "score": score, "rating": rating}
@@ -162,6 +168,7 @@ def summarize(signals: list[dict]) -> dict:
         "signals": len(signals), "tickers": len({s["ticker"] for s in signals}),
         "first": days[0] if days else None, "last": days[-1] if days else None,
         "step": STEP, "caveats": CAVEATS, "computed_at": time.time(),
+        "engine_v": analysis.ENGINE_VERSION,
     }
 
 

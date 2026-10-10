@@ -265,6 +265,10 @@ def build_report_pdf(results: dict, errors: dict) -> bytes:
             f"Last daily candle: {escape(str(r['pattern']))}", st["body"]))
         # (no emoji: the PDF font has none and printed a black square instead)
         block.append(Paragraph(f"<b>Verdict:</b> {escape(str(r.get('verdict', '')))}", st["body"]))
+        # what a verdict is (and is not) belongs next to it, not only in the footer
+        notes = [str(r[k]) for k in ("disclaimer", "rating_note") if r.get(k)]
+        if notes:
+            block.append(Paragraph(escape(" ".join(notes)), st["small"]))
         for line in _extras_lines(r):
             block.append(Paragraph(line, st["body"]))
         block.append(Spacer(1, 4))

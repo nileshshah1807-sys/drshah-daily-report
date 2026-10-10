@@ -208,6 +208,14 @@ def _score_at(df, pos: int, bench) -> tuple:
     return (_day(df.index[pos]), r["score"], r["rating"], r["price"], 1)
 
 
+def closing_scores(df, bench) -> dict[str, tuple]:
+    """Closing score rows for every session of df, keyed by date — all of
+    them in ONE pass over the price history (the same numbers as _score_at,
+    which runs a whole analysis per day)."""
+    return {s["date"]: (s["date"], s["score"], s["rating"], s["price"], 1)
+            for s in analyzer.score_series(df, benchmark=bench)}
+
+
 _ticker_locks: dict[str, threading.Lock] = {}
 
 
@@ -239,8 +247,13 @@ def backfill_history(ticker: str, df, bench, sessions: int | None = None) -> int
         if not positions:
             return 0
         have = _history(ticker, since=_day(df.index[min(positions)]))
-        rows = [_score_at(df, pos, bench) for pos in sorted(positions)
-                if not have.get(_day(df.index[pos]), {}).get("final")]
+        missing = [pos for pos in sorted(positions)
+                   if not have.get(_day(df.index[pos]), {}).get("final")]
+        if not missing:
+            return 0
+        scores = closing_scores(df, bench)
+        rows = [scores.get(_day(df.index[pos])) or _score_at(df, pos, bench)
+                for pos in missing]
         _store_scores(ticker, rows)
         return len(rows)
 

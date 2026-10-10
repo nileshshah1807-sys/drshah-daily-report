@@ -1,0 +1,15 @@
+Fonts in this folder
+====================
+
+plex-sans-var.woff2     IBM Plex Sans (variable weight 100-700, Latin subset)
+plex-serif-500.woff2    IBM Plex Serif Medium (Latin subset)
+plex-serif-600.woff2    IBM Plex Serif SemiBold (Latin subset)
+
+Copyright (c) 2017 IBM Corp. with Reserved Font Name "Plex".
+
+These fonts are licensed under the SIL Open Font License, Version 1.1.
+The licence text is available at https://openfontlicense.org and with the
+font sources at https://github.com/IBM/plex
+
+The files were downloaded from the Fontsource project (https://fontsource.org)
+and are bundled so the app does not need the internet to show its fonts.
