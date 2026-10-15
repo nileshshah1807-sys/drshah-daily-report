@@ -5,7 +5,9 @@ Builds the same PDF the desktop app builds at 09:00 and sends it by email and
 Telegram, using the app's own analysis, PDF and delivery code. It runs once and
 exits; nothing is left running.
 
-The watchlist comes from cloud_watchlist.json. Passwords come from environment
+The watchlist comes from the web version (WEB_WATCHLIST_URL + WEB_WATCHLIST_TOKEN),
+the list the owner edits every day; cloud_watchlist.json (copied from the laptop
+app) is used only when the web version cannot be reached. Passwords come from environment
 variables (GitHub Secrets), never from a file in the repository:
 
   SMTP_USER, SMTP_PASS, EMAIL_TO            email
@@ -124,12 +126,25 @@ def write_config(due: list[str]) -> None:
         json.dump(cfg, f, indent=2)
 
 
-def load_watchlist() -> tuple[str, list[str]]:
+def load_watchlist(scheduler=None) -> tuple[str, list[str], str]:
+    """(account, tickers, name shown in the report's message)."""
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "cloud_watchlist.json"), encoding="utf-8") as f:
         wl = json.load(f)
+    account = str(wl.get("account") or "Watchlist")
     tickers = [str(t).strip().upper() for t in wl.get("tickers") or [] if str(t).strip()]
-    return str(wl.get("account") or "Watchlist"), tickers
+    url, token = _env("WEB_WATCHLIST_URL"), _env("WEB_WATCHLIST_TOKEN")
+    if not (url and token and scheduler):
+        return account, tickers, account
+    try:
+        got = scheduler.fetch_web_watchlist(url, token)
+    except Exception as e:  # noqa: BLE001 — the report still goes out, from the copy
+        log.warning("the web version's watchlist could not be loaded (%s); using "
+                    "cloud_watchlist.json (%d stocks)", e, len(tickers))
+        return account, tickers, f"{account} (last list copied from the laptop: the web version could not be reached)"
+    log.info("watchlist from the web version: %d stock(s)", len(got["tickers"]))
+    account = got["account"] or account
+    return account, got["tickers"], account
 
 
 def analyse(analysis, tickers: list[str]) -> dict:
@@ -246,9 +261,9 @@ def main() -> int:
     import scheduler
     import store
 
-    account, tickers = load_watchlist()
+    account, tickers, who = load_watchlist(scheduler)
     if not tickers:
-        log.error("cloud_watchlist.json has no tickers")
+        log.error("the watchlist has no tickers")
         return 2
     log.info("daily report for %s: %d stock(s), %s", account, len(tickers),
              datetime.now().strftime("%d %b %Y %H:%M %Z").strip())
@@ -293,7 +308,7 @@ def main() -> int:
         log.error(p)
     wanted = scheduler.delivery_working(cfg, only_if_scheduled=False)
 
-    done = scheduler._deliver_report(cfg, cfg["schedule"], account, path, payload)
+    done = scheduler._deliver_report(cfg, cfg["schedule"], who, path, payload)
     # channels whose first try failed for a passing reason and were queued for retry
     queued = {ch for it in scheduler._load_pending() for ch in it.get("channels") or []}
     # The app retries a failed delivery every 5 minutes; this run is short-lived,

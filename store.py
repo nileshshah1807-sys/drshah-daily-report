@@ -37,6 +37,9 @@ DEFAULT_CONFIG = {
     "auto_login": {"enabled": False, "username": ""},
     # may phones / other PCs on the same network open the app? (needs a restart)
     "network": {"lan_access": True},
+    # the owner's daily report follows the watchlist kept on the web version
+    # (its address and the report token; see scheduler.report_watchlist)
+    "web_watchlist": {"enabled": False, "url": "", "token": ""},
 }
 
 _lock = threading.Lock()

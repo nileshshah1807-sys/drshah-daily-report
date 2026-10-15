@@ -716,6 +716,8 @@ def api_settings():
     safe = json.loads(json.dumps(cfg))
     safe["email"]["smtp_pass"] = "••••••" if safe["email"].get("smtp_pass") else ""
     safe["telegram"]["bot_token"] = "••••••" if safe["telegram"].get("bot_token") else ""
+    if isinstance(safe.get("web_watchlist"), dict):
+        safe["web_watchlist"]["token"] = "••••••" if safe["web_watchlist"].get("token") else ""
     safe["secret_key"] = None
     safe.pop("auto_login", None)          # per-account: served by /api/auth/me
     # why a scheduled report would not be delivered (shown in Settings and once
@@ -960,6 +962,22 @@ def api_settings_save():
     if isinstance(net, dict) and "lan_access" in net:
         cfg.setdefault("network", {})["lan_access"] = bool(net.get("lan_access"))
 
+    # the owner's daily report follows the web version's watchlist
+    ww = body.get("web_watchlist")
+    if isinstance(ww, dict):
+        sec = cfg.setdefault("web_watchlist", {"enabled": False, "url": "", "token": ""})
+        sec["enabled"] = bool(ww.get("enabled"))
+        if ww.get("url") is not None:
+            url = str(ww["url"]).strip()
+            if url and not url.startswith("https://"):
+                warnings.append("The web version's address was NOT saved — it must start "
+                                "with https://")
+            else:
+                sec["url"] = url
+        tok = str(ww.get("token") or "")
+        if tok and tok.replace("•", "").strip():
+            sec["token"] = tok.strip()
+
     store.save_config(cfg)
     return jsonify({"ok": True, "message": "Settings saved.", "warnings": warnings})
 
@@ -1129,7 +1147,7 @@ VALID_ALERT_KINDS = {"price_above", "price_below", "rsi_above", "rsi_below",
 NO_VALUE_KINDS = ("breakout", "breakdown", "rating_change")   # need no target value
 VALID_CHANNELS = {"app", "email", "telegram"}
 SETTINGS_KEYS = ("alert_check_minutes", "email", "telegram", "schedule", "prewarm")
-SAVED_PASSWORDS = (("email", "smtp_pass"), ("telegram", "bot_token"))
+SAVED_PASSWORDS = (("email", "smtp_pass"), ("telegram", "bot_token"), ("web_watchlist", "token"))
 
 
 def _alert_value(kind: str, value):

@@ -101,6 +101,9 @@ jobs:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # the list the owner edits on the web version; cloud_watchlist.json is the stand-in
+          WEB_WATCHLIST_URL: https://drshah-stocks.vercel.app/api/web/report-watchlist
+          WEB_WATCHLIST_TOKEN: ${{ secrets.WEB_WATCHLIST_TOKEN }}
         run: python cloud_report.py $FLAGS
 
       # Saved even when the step above reports a problem: a channel the report

@@ -9,9 +9,12 @@ import glob
 import json
 import logging
 import os
+import re
 import smtplib
 import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta
 
 import alerts
@@ -558,6 +561,69 @@ def describe_run(result: dict, cfg: dict, when: datetime | None = None) -> str:
     return line + (" — " + " ".join(problems) if problems else "")
 
 
+# ---------------------------------------------------------------------------
+# The owner's report can follow the watchlist kept on the web version
+# ---------------------------------------------------------------------------
+# (added 15 Oct 2026: the owner adds and removes stocks on the web version
+#  every day, while the report was made from this computer's own list)
+
+_TICKER = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
+
+
+def fetch_web_watchlist(url: str, token: str, tries: int = 3, timeout: int = 25,
+                        pause_s: float = 5.0) -> dict:
+    """The owner's watchlist on the web version: {"account", "tickers", "version"}.
+
+    Raises RuntimeError with a plain reason when it cannot be had. A first call
+    can meet a web version that is still starting, so it is tried a few times;
+    a refused token or a wrong address is not tried again."""
+    last = "no answer"
+    for attempt in range(tries):
+        try:
+            req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token,
+                                                       "User-Agent": "DrShah daily report"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            tickers = [t for t in (data.get("tickers") or [])
+                       if isinstance(t, str) and _TICKER.match(t)][:store.MAX_WATCHLIST]
+            if data.get("ok") and tickers:
+                return {"account": str(data.get("account") or ""), "tickers": tickers,
+                        "version": data.get("data_version")}
+            last = str(data.get("error") or "the web version sent an empty watchlist")
+        except urllib.error.HTTPError as e:
+            last = f"HTTP {e.code}"
+            if e.code in (401, 403, 404):
+                break                     # wrong token or address: trying again will not help
+        except Exception as e:  # noqa: BLE001 — network, start-up, bad answer
+            last = f"{type(e).__name__}: {str(e)[:120]}"
+        if attempt + 1 < tries:
+            time.sleep(pause_s * (attempt + 1))
+    raise RuntimeError(last)
+
+
+def report_watchlist(cfg: dict, user_id: int, username: str) -> tuple[list[str], str]:
+    """(tickers, name shown in the report's message) for an account's daily report.
+
+    The owner's report uses the web version's watchlist when Settings →
+    web_watchlist is switched on. If the web version cannot be reached the
+    report still goes out, made from this computer's list, and its message says so."""
+    own = store.get_watchlist(user_id)
+    web = cfg.get("web_watchlist") or {}
+    if not (web.get("enabled") and web.get("url") and web.get("token")):
+        return own, username
+    if user_id != store.first_user_id():
+        return own, username
+    try:
+        got = fetch_web_watchlist(str(web["url"]), str(web["token"]))
+    except Exception as e:  # noqa: BLE001
+        log.warning("the web version's watchlist could not be loaded (%s) — the report "
+                    "uses this computer's watchlist", e)
+        return own, f"{username} (this computer's list: the web version could not be reached)"
+    log.info("daily report for %s uses the web version's watchlist (%d stocks)",
+             username, len(got["tickers"]))
+    return got["tickers"], username
+
+
 def run_daily_reports() -> dict:
     """Generate a dated report PDF for every user + guest; deliver via
     email &/or Telegram when enabled; prune old files."""
@@ -586,14 +652,14 @@ def run_daily_reports() -> dict:
 
     for u in users:
         try:
-            wl = store.get_watchlist(u["id"])
+            wl, who = report_watchlist(cfg, u["id"], u["username"])
             payload = analysis.analyze_watchlist(wl)
             data = pdfexport.build_report_pdf(payload["results"], payload["errors"])
             path = os.path.join(REPORTS_DIR, f"report_{stamp}_{u['username']}.pdf")
             with open(path, "wb") as f:
                 f.write(data)
             generated.append(path)
-            _count(_deliver_report(cfg, sched, u["username"], path, payload, u["email"] or ""))
+            _count(_deliver_report(cfg, sched, who, path, payload, u["email"] or ""))
         except Exception as e:  # noqa: BLE001
             log.error("report failed for %s: %s", u["username"], e)
 
